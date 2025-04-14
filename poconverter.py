@@ -1,12 +1,20 @@
+!pip install xlsxwriter --quiet
 import pandas as pd
 import json
 import re
 from google.colab import files
 from io import StringIO
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import datetime
 
 # --- Helper functions ---
 
 def parse_po_blocks(content):
+    """
+    Splits the .po file into blocks (separated by blank lines),
+    concatenates multi-line msgid and msgctxt.
+    """
     blocks = []
     raw_blocks = re.split(r'\n\s*\n', content.strip(), flags=re.MULTILINE)
     for block in raw_blocks:
@@ -14,17 +22,34 @@ def parse_po_blocks(content):
         msgstr_index = None
         msgctxt = ""
         msgid = ""
+        collecting_msgid = False
+        collecting_msgctxt = False
+        full_msgid = ""
+        full_msgctxt = ""
         for idx, line in enumerate(lines):
             if line.startswith("msgctxt"):
-                m = re.search(r'"(.*)"', line)
-                if m:
-                    msgctxt = m.group(1)
-            elif line.startswith("msgid"):
-                m = re.search(r'"(.*)"', line)
-                if m:
-                    msgid = m.group(1)
-            elif line.startswith("msgstr"):
+                collecting_msgctxt = True
+                full_msgctxt = extract_quoted_text(line)
+                msgctxt = full_msgctxt
+            elif collecting_msgctxt and line.startswith('"'):
+                full_msgctxt += extract_quoted_text(line)
+                msgctxt = full_msgctxt
+            else:
+                collecting_msgctxt = False
+
+            if line.startswith("msgid"):
+                collecting_msgid = True
+                full_msgid = extract_quoted_text(line)
+                msgid = full_msgid
+            elif collecting_msgid and line.startswith('"'):
+                full_msgid += extract_quoted_text(line)
+                msgid = full_msgid
+            else:
+                collecting_msgid = False
+
+            if line.startswith("msgstr"):
                 msgstr_index = idx
+
         blocks.append({
             "lines": lines,
             "msgstr_index": msgstr_index,
@@ -33,13 +58,23 @@ def parse_po_blocks(content):
         })
     return blocks
 
-def extract_msgstrs(blocks):
+def extract_quoted_text(line):
+    m = re.search(r'"(.*)"', line)
+    return m.group(1) if m else ""
+
+def extract_msgstrs(blocks, visible_indices):
+    # Return a list of msgstr for blocks that are marked visible.
     msgstrs = []
-    for b in blocks:
+    for i in visible_indices:
+        b = blocks[i]
         idx = b["msgstr_index"]
-        if idx is not None:
-            m = re.search(r'"(.*)"', b["lines"][idx])
-            msgstrs.append(m.group(1) if m else "")
+        if idx is None:
+            msgstrs.append("")
+            continue
+        first = b["lines"][idx]
+        m = re.search(r'^msgstr\s+"(.*)"', first)
+        if m:
+            msgstrs.append(m.group(1))
         else:
             msgstrs.append("")
     return msgstrs
@@ -51,16 +86,20 @@ def generate_excel_from_pos():
     uploaded = files.upload()
     if not uploaded:
         raise ValueError("❌ No files uploaded.")
-    
+
     po_files = {fname: uploaded[fname] for fname in uploaded if fname.lower().endswith('.po')}
     if not po_files:
         raise ValueError("❌ No .po files found in uploaded files.")
-    
-    contents_data = {}
-    tech_rows = []
+
+    contents_data = {}  # For the Contents sheet (visible blocks only)
+    tech_rows = []      # Full technical details for all blocks, with a visibility flag.
+    preserve_index = [] # Indices of blocks to be *skipped* from the Contents sheet.
+    visible_indices = []  # Indices (in order) that are visible
 
     file_names = list(po_files.keys())
     print(f"🗂 Found {len(file_names)} .po files.")
+
+    num_blocks = None
 
     for idx, fname in enumerate(file_names):
         content = po_files[fname].decode("utf-8", errors="replace")
@@ -68,40 +107,58 @@ def generate_excel_from_pos():
         line_count = len(content.splitlines())
 
         if idx == 0:
-            # First file: create ID and SOURCE TEXT columns
-            contents_data["ID"] = [b["msgctxt"] for b in blocks]
-            contents_data["SOURCE TEXT"] = [b["msgid"] for b in blocks]
+            id_list = []
+            src_texts = []
+            for i, b in enumerate(blocks):
+                # A block is technical (not visible) if its msgid is empty and
+                # it does not consist of multi-line quoted content.
+                # (i.e. if msgid is empty and there are no additional msgid quoted lines)
+                if b["msgid"].strip() == "" and not any(l.strip().startswith('"') for l in b["lines"] if "msgid" in l):
+                    preserve_index.append(i)
+                else:
+                    visible_indices.append(i)
+                    id_list.append(b["msgctxt"])
+                    src_texts.append(b["msgid"])
+            contents_data["ID"] = id_list
+            contents_data["SOURCE TEXT"] = src_texts
             num_blocks = len(blocks)
-        
         else:
-            # Validate block count consistency
             if len(blocks) != num_blocks:
                 raise ValueError(f"❌ File {fname} has {len(blocks)} blocks, expected {num_blocks}.")
 
-        # Add msgstrs to contents_data under this file’s name
-        contents_data[fname] = extract_msgstrs(blocks)
+        # For the translation columns, only include visible blocks.
+        all_msgstrs = extract_msgstrs(blocks, list(range(num_blocks)))
+        filtered_msgstrs = [all_msgstrs[i] for i in range(num_blocks) if i not in preserve_index]
+        contents_data[fname] = filtered_msgstrs
 
-        # Store full technical info block-by-block
+        # For the technical sheet, store every block and add a flag "visible" (True if not in preserve_index)
         for i, blk in enumerate(blocks):
-            template = {
-                "lines": blk["lines"],
-                "msgstr_index": blk["msgstr_index"]
-            }
             tech_rows.append({
                 "File Name": fname,
                 "Block Index": i,
-                "Block Template": json.dumps(template, ensure_ascii=False),
-                "Line Count": line_count
+                "Block Template": json.dumps({
+                    "lines": blk["lines"],
+                    "msgstr_index": blk["msgstr_index"]
+                }, ensure_ascii=False),
+                "Line Count": line_count,
+                "Visible": i not in preserve_index
             })
 
-    # Create Excel file
     df_contents = pd.DataFrame(contents_data)
     df_technical = pd.DataFrame(tech_rows)
 
-    output_excel = "compiled_po_data.xlsx"
+    output_excel = f"compiled_po_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(output_excel, engine="xlsxwriter") as writer:
         df_contents.to_excel(writer, sheet_name="Contents", index=False)
         df_technical.to_excel(writer, sheet_name="Technical", index=False)
+
+        # Apply formatting to the Contents sheet
+        workbook  = writer.book
+        worksheet = writer.sheets["Contents"]
+
+        # Set the width of each column to 40
+        for col_num, column in enumerate(df_contents.columns):
+            worksheet.set_column(col_num, col_num, 40)
 
     print("✅ Excel created. Downloading...")
     files.download(output_excel)
@@ -113,43 +170,55 @@ def reconstruct_pos_from_excel():
     uploaded = files.upload()
     if not uploaded:
         raise ValueError("❌ No Excel file uploaded.")
-    
+
     excel_fname = next(iter(uploaded))
     df_contents = pd.read_excel(excel_fname, sheet_name="Contents")
     df_technical = pd.read_excel(excel_fname, sheet_name="Technical")
 
-    num_blocks = df_contents.shape[0]
-    all_files = df_contents.columns[2:]  # skip ID and SOURCE TEXT
+    num_visible = df_contents.shape[0]
+    all_files = df_contents.columns[2:]
     generated_files = []
 
     for fname in all_files:
         print(f"\n📄 Reconstructing: {fname}")
         file_blocks = df_technical[df_technical["File Name"] == fname].sort_values(by="Block Index")
-        if file_blocks.shape[0] != num_blocks:
-            raise ValueError(f"❌ Block mismatch in {fname}: expected {num_blocks}, got {file_blocks.shape[0]}")
+        if file_blocks.empty:
+            print(f"⚠️ Skipping {fname}: No data found.")
+            continue
 
         po_blocks = []
-        for i, row in file_blocks.iterrows():
+        translation_index = 0  # index in the Contents sheet for visible blocks
+
+        for _, row in file_blocks.iterrows():
             template = json.loads(row["Block Template"])
-            msgstr_line_index = template["msgstr_index"]
             lines = template["lines"]
+            msgstr_index = template["msgstr_index"]
+            visible = row["Visible"]  # True/False
             new_lines = lines.copy()
-            new_msgstr = df_contents.iloc[int(row["Block Index"])][fname]
-            new_msgstr = "" if pd.isna(new_msgstr) else str(new_msgstr)
 
-
-            if msgstr_line_index is not None and msgstr_line_index < len(new_lines):
-                new_lines[msgstr_line_index] = f'msgstr "{new_msgstr}"'
-
+            if visible:
+                # For visible blocks, take the translation from the Contents sheet.
+                # If the corresponding translation cell is empty, leave as empty.
+                new_msgstr = df_contents.iloc[translation_index][fname]
+                translation_index += 1
+                if pd.isna(new_msgstr):
+                    new_msgstr = ""
+                # Force single-line: even if new_msgstr contains real newline characters,
+                # replace them with literal \n
+                flat_translation = new_msgstr.replace("\r\n", "\n").replace("\n", "\\n")
+                if msgstr_index is not None and 0 <= msgstr_index < len(new_lines):
+                    new_lines[msgstr_index] = f'msgstr "{flat_translation}"'
+            # For non-visible (technical) blocks, leave the block unchanged.
             po_blocks.append("\n".join(new_lines))
 
-        full_po = "\n\n".join(po_blocks) + "\n"
+        full_po = "\n\n".join(po_blocks)  # Ensure no extra newline at the end
         with open(fname, "w", encoding="utf-8") as f:
             f.write(full_po)
 
+        # Optionally, you could perform a validation here.
         actual_lines = full_po.count("\n") + 1
         expected_lines = int(file_blocks["Line Count"].iloc[0])
-        print(f"✅ {fname}: {num_blocks} blocks, {actual_lines} lines (expected: {expected_lines})")
+        print(f"✅ {fname}: {actual_lines} lines (expected: {expected_lines})")
         generated_files.append(fname)
 
     for f in generated_files:
@@ -157,14 +226,29 @@ def reconstruct_pos_from_excel():
 
 # --- Menu ---
 
-print("👋 Welcome! What would you like to do?")
-print("1️⃣  Convert .po files ➜ Excel")
-print("2️⃣  Reconstruct .po files from Excel")
-choice = input("Enter 1 or 2: ").strip()
+def start_menu():
+    output = widgets.Output()
 
-if choice == "1":
-    generate_excel_from_pos()
-elif choice == "2":
-    reconstruct_pos_from_excel()
-else:
-    print("❌ Invalid choice.")
+    def on_button_click(choice):
+        button1.disabled = True
+        button2.disabled = True
+        clear_output(wait=True)
+        if choice == "1":
+            generate_excel_from_pos()
+        elif choice == "2":
+            reconstruct_pos_from_excel()
+
+
+    button1 = widgets.Button(description="📥 .PO ➜ XLSX")
+    button2 = widgets.Button(description="📤 XLSX ➜ .PO")
+
+    button1.on_click(lambda b: on_button_click("1"))
+    button2.on_click(lambda b: on_button_click("2"))
+
+    display(widgets.VBox([
+        widgets.Label("👋 Welcome! Please choose an option:"),
+        button1,
+        button2
+    ]))
+
+start_menu()
