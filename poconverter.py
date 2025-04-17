@@ -11,10 +11,6 @@ import datetime
 # --- Helper functions ---
 
 def parse_po_blocks(content):
-    """
-    Splits the .po file into blocks (separated by blank lines),
-    concatenates multi-line msgid and msgctxt.
-    """
     blocks = []
     raw_blocks = re.split(r'\n\s*\n', content.strip(), flags=re.MULTILINE)
     for block in raw_blocks:
@@ -62,8 +58,8 @@ def extract_quoted_text(line):
     m = re.search(r'"(.*)"', line)
     return m.group(1) if m else ""
 
+# --- PATCHED: Extract full multi-line msgstr blocks ---
 def extract_msgstrs(blocks, visible_indices):
-    # Return a list of msgstr for blocks that are marked visible.
     msgstrs = []
     for i in visible_indices:
         b = blocks[i]
@@ -71,12 +67,21 @@ def extract_msgstrs(blocks, visible_indices):
         if idx is None:
             msgstrs.append("")
             continue
-        first = b["lines"][idx]
-        m = re.search(r'^msgstr\s+"(.*)"', first)
-        if m:
-            msgstrs.append(m.group(1))
-        else:
-            msgstrs.append("")
+
+        msgstr_lines = []
+        started = False
+        for line in b["lines"][idx:]:
+            if line.startswith("msgstr"):
+                started = True
+                m = re.match(r'msgstr\s+"(.*)"', line)
+                msgstr_lines.append(m.group(1) if m else "")
+            elif started and line.strip().startswith('"'):
+                msgstr_lines.append(extract_quoted_text(line))
+            else:
+                break
+
+        full_msgstr = "\n".join(msgstr_lines)
+        msgstrs.append(full_msgstr)
     return msgstrs
 
 # --- PHASE 1: Convert .po files into Excel ---
@@ -91,10 +96,10 @@ def generate_excel_from_pos():
     if not po_files:
         raise ValueError("❌ No .po files found in uploaded files.")
 
-    contents_data = {}  # For the Contents sheet (visible blocks only)
-    tech_rows = []      # Full technical details for all blocks, with a visibility flag.
-    preserve_index = [] # Indices of blocks to be *skipped* from the Contents sheet.
-    visible_indices = []  # Indices (in order) that are visible
+    contents_data = {}
+    tech_rows = []
+    preserve_index = []
+    visible_indices = []
 
     file_names = list(po_files.keys())
     print(f"🗂 Found {len(file_names)} .po files.")
@@ -109,16 +114,23 @@ def generate_excel_from_pos():
         if idx == 0:
             id_list = []
             src_texts = []
+            contexts = []
+
             for i, b in enumerate(blocks):
-                # A block is technical (not visible) if its msgid is empty and
-                # it does not consist of multi-line quoted content.
-                # (i.e. if msgid is empty and there are no additional msgid quoted lines)
                 if b["msgid"].strip() == "" and not any(l.strip().startswith('"') for l in b["lines"] if "msgid" in l):
                     preserve_index.append(i)
                 else:
                     visible_indices.append(i)
+
+                    # Extract context comments
+                    comment_lines = [line.strip() for line in b["lines"] if line.strip().startswith("#")]
+                    context_text = "\n".join(comment_lines)
+
+                    contexts.append(context_text)
                     id_list.append(b["msgctxt"])
                     src_texts.append(b["msgid"])
+
+            contents_data["Context"] = contexts
             contents_data["ID"] = id_list
             contents_data["SOURCE TEXT"] = src_texts
             num_blocks = len(blocks)
@@ -126,12 +138,10 @@ def generate_excel_from_pos():
             if len(blocks) != num_blocks:
                 raise ValueError(f"❌ File {fname} has {len(blocks)} blocks, expected {num_blocks}.")
 
-        # For the translation columns, only include visible blocks.
         all_msgstrs = extract_msgstrs(blocks, list(range(num_blocks)))
         filtered_msgstrs = [all_msgstrs[i] for i in range(num_blocks) if i not in preserve_index]
         contents_data[fname] = filtered_msgstrs
 
-        # For the technical sheet, store every block and add a flag "visible" (True if not in preserve_index)
         for i, blk in enumerate(blocks):
             tech_rows.append({
                 "File Name": fname,
@@ -152,11 +162,9 @@ def generate_excel_from_pos():
         df_contents.to_excel(writer, sheet_name="Contents", index=False)
         df_technical.to_excel(writer, sheet_name="Technical", index=False)
 
-        # Apply formatting to the Contents sheet
         workbook  = writer.book
         worksheet = writer.sheets["Contents"]
 
-        # Set the width of each column to 40
         for col_num, column in enumerate(df_contents.columns):
             worksheet.set_column(col_num, col_num, 40)
 
@@ -176,7 +184,7 @@ def reconstruct_pos_from_excel():
     df_technical = pd.read_excel(excel_fname, sheet_name="Technical")
 
     num_visible = df_contents.shape[0]
-    all_files = df_contents.columns[2:]
+    all_files = df_contents.columns[3:]  # Adjusted because of new "Context" column
     generated_files = []
 
     for fname in all_files:
@@ -187,35 +195,39 @@ def reconstruct_pos_from_excel():
             continue
 
         po_blocks = []
-        translation_index = 0  # index in the Contents sheet for visible blocks
+        translation_index = 0
 
         for _, row in file_blocks.iterrows():
             template = json.loads(row["Block Template"])
             lines = template["lines"]
             msgstr_index = template["msgstr_index"]
-            visible = row["Visible"]  # True/False
+            visible = row["Visible"]
             new_lines = lines.copy()
 
             if visible:
-                # For visible blocks, take the translation from the Contents sheet.
-                # If the corresponding translation cell is empty, leave as empty.
                 new_msgstr = df_contents.iloc[translation_index][fname]
                 translation_index += 1
                 if pd.isna(new_msgstr):
                     new_msgstr = ""
-                # Force single-line: even if new_msgstr contains real newline characters,
-                # replace them with literal \n
-                flat_translation = new_msgstr.replace("\r\n", "\n").replace("\n", "\\n")
+
+                # --- PATCHED: preserve multi-line formatting ---
                 if msgstr_index is not None and 0 <= msgstr_index < len(new_lines):
-                    new_lines[msgstr_index] = f'msgstr "{flat_translation}"'
-            # For non-visible (technical) blocks, leave the block unchanged.
+                    translated_lines = new_msgstr.replace("\r\n", "\n").split("\n")
+                    new_msgstr_block = [f'msgstr "{translated_lines[0]}"']
+                    for extra_line in translated_lines[1:]:
+                        new_msgstr_block.append(f'"{extra_line}"')
+
+                    end_index = msgstr_index + 1
+                    while end_index < len(new_lines) and new_lines[end_index].strip().startswith('"'):
+                        end_index += 1
+                    new_lines[msgstr_index:end_index] = new_msgstr_block
+
             po_blocks.append("\n".join(new_lines))
 
-        full_po = "\n\n".join(po_blocks)  # Ensure no extra newline at the end
+        full_po = "\n\n".join(po_blocks)
         with open(fname, "w", encoding="utf-8") as f:
             f.write(full_po)
 
-        # Optionally, you could perform a validation here.
         actual_lines = full_po.count("\n") + 1
         expected_lines = int(file_blocks["Line Count"].iloc[0])
         print(f"✅ {fname}: {actual_lines} lines (expected: {expected_lines})")
@@ -237,7 +249,6 @@ def start_menu():
             generate_excel_from_pos()
         elif choice == "2":
             reconstruct_pos_from_excel()
-
 
     button1 = widgets.Button(description="📥 .PO ➜ XLSX")
     button2 = widgets.Button(description="📤 XLSX ➜ .PO")
