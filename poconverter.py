@@ -1,9 +1,7 @@
 !pip install xlsxwriter --quiet
 import pandas as pd
-import json
 import re
 from google.colab import files
-from io import StringIO
 import ipywidgets as widgets
 from IPython.display import display, clear_output
 import datetime
@@ -58,7 +56,6 @@ def extract_quoted_text(line):
     m = re.search(r'"(.*)"', line)
     return m.group(1) if m else ""
 
-# --- PATCHED: Extract full multi-line msgstr blocks ---
 def extract_msgstrs(blocks, visible_indices):
     msgstrs = []
     for i in visible_indices:
@@ -101,6 +98,8 @@ def generate_excel_from_pos():
     preserve_index = []
     visible_indices = []
 
+    sep = "<|LINE|>"  # safe delimiter
+
     file_names = list(po_files.keys())
     print(f"🗂 Found {len(file_names)} .po files.")
 
@@ -122,7 +121,6 @@ def generate_excel_from_pos():
                 else:
                     visible_indices.append(i)
 
-                    # Extract context comments
                     comment_lines = [line.strip() for line in b["lines"] if line.strip().startswith("#")]
                     context_text = "\n".join(comment_lines)
 
@@ -146,13 +144,32 @@ def generate_excel_from_pos():
             tech_rows.append({
                 "File Name": fname,
                 "Block Index": i,
-                "Block Template": json.dumps({
-                    "lines": blk["lines"],
-                    "msgstr_index": blk["msgstr_index"]
-                }, ensure_ascii=False),
+                "Block Template": sep.join(blk["lines"]),
                 "Line Count": line_count,
                 "Visible": i not in preserve_index
             })
+
+    # --- NEW: Check for and handle strings that exceed Excel's cell limit ---
+    max_excel_chars = 32767
+    problematic_cells = []
+
+    # Check all data that's about to be written to the "Contents" sheet
+    for col_name, data_list in contents_data.items():
+        for row_index, cell_value in enumerate(data_list):
+            if isinstance(cell_value, str) and len(cell_value) > max_excel_chars:
+                problematic_cells.append( (col_name, row_index, len(cell_value)) )
+                # Truncate the value and add an annotation to prevent the crash
+                contents_data[col_name][row_index] = cell_value[:max_excel_chars - 100] + f"... [TRUNCATED - Original length was {len(cell_value)} characters, exceeding Excel's limit]"
+
+    # Print a warning for the user
+    if problematic_cells:
+        print("\n⚠️  WARNING: Some translation strings exceed Excel's cell limit of 32,767 characters.")
+        print("   These cells have been truncated to avoid a fatal error.")
+        print("   The problematic cells are (Column, Row Index, Original Length):")
+        for col, row, length in problematic_cells:
+            print(f"   - {col}, Row ~{row+2}: {length} chars")
+        print("   Review these strings in the original .po file. They are likely not single lines but large blocks of text.\n")
+    # --- END OF NEW CODE ---
 
     df_contents = pd.DataFrame(contents_data)
     df_technical = pd.DataFrame(tech_rows)
@@ -183,8 +200,8 @@ def reconstruct_pos_from_excel():
     df_contents = pd.read_excel(excel_fname, sheet_name="Contents")
     df_technical = pd.read_excel(excel_fname, sheet_name="Technical")
 
-    num_visible = df_contents.shape[0]
-    all_files = df_contents.columns[3:]  # Adjusted because of new "Context" column
+    sep = "<|LINE|>"
+    all_files = df_contents.columns[3:]
     generated_files = []
 
     for fname in all_files:
@@ -198,9 +215,13 @@ def reconstruct_pos_from_excel():
         translation_index = 0
 
         for _, row in file_blocks.iterrows():
-            template = json.loads(row["Block Template"])
-            lines = template["lines"]
-            msgstr_index = template["msgstr_index"]
+            lines = str(row["Block Template"]).split(sep)
+            msgstr_index = None
+            for idx, line in enumerate(lines):
+                if line.startswith("msgstr"):
+                    msgstr_index = idx
+                    break
+
             visible = row["Visible"]
             new_lines = lines.copy()
 
@@ -210,12 +231,11 @@ def reconstruct_pos_from_excel():
                 if pd.isna(new_msgstr):
                     new_msgstr = ""
 
-                # --- PATCHED: preserve multi-line formatting ---
                 if msgstr_index is not None and 0 <= msgstr_index < len(new_lines):
                     translated_lines = new_msgstr.replace("\r\n", "\n").split("\n")
-                    new_msgstr_block = [f'msgstr "{translated_lines[0]}"']
+                    new_msgstr_block = [f'msgstr "{translated_lines[0].replace("\"", "\\\"")}"']
                     for extra_line in translated_lines[1:]:
-                        new_msgstr_block.append(f'"{extra_line}"')
+                        new_msgstr_block.append(f'"{extra_line.replace("\"", "\\\"")}"')
 
                     end_index = msgstr_index + 1
                     while end_index < len(new_lines) and new_lines[end_index].strip().startswith('"'):
