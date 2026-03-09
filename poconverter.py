@@ -56,6 +56,9 @@ def extract_quoted_text(line):
     m = re.search(r'"(.*)"', line)
     return m.group(1) if m else ""
 
+def escape_po_quotes(text):
+    return re.sub(r'(?<!\\)"', r'\"', text)
+
 def extract_msgstrs(blocks, visible_indices):
     msgstrs = []
     for i in visible_indices:
@@ -233,9 +236,13 @@ def reconstruct_pos_from_excel():
 
                 if msgstr_index is not None and 0 <= msgstr_index < len(new_lines):
                     translated_lines = new_msgstr.replace("\r\n", "\n").split("\n")
-                    new_msgstr_block = [f'msgstr "{translated_lines[0].replace("\"", "\\\"")}"']
+
+                    first_line = escape_po_quotes(translated_lines[0])
+                    new_msgstr_block = [f'msgstr "{first_line}"']
+
                     for extra_line in translated_lines[1:]:
-                        new_msgstr_block.append(f'"{extra_line.replace("\"", "\\\"")}"')
+                        escaped_line = escape_po_quotes(extra_line)
+                        new_msgstr_block.append(f'"{escaped_line}"')
 
                     end_index = msgstr_index + 1
                     while end_index < len(new_lines) and new_lines[end_index].strip().startswith('"'):
