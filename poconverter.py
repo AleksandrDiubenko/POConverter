@@ -235,7 +235,10 @@ def reconstruct_pos_from_excel():
                     new_msgstr = ""
 
                 if msgstr_index is not None and 0 <= msgstr_index < len(new_lines):
-                    translated_lines = new_msgstr.replace("\r\n", "\n").split("\n")
+                    normalized = new_msgstr.replace("\r\n", "\n")
+                    normalized = normalized.replace("\n", "\\n")
+
+                    translated_lines = [normalized]
 
                     first_line = escape_po_quotes(translated_lines[0])
                     new_msgstr_block = [f'msgstr "{first_line}"']
